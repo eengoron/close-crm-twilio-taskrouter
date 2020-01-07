@@ -22,7 +22,7 @@ close_user_ids_to_twilio_worker_ids = {}
 close_user_ids_to_current_calls = {}
 close_user_ids_to_twilio_phone_numbers = {}
 close_hold_music_phone_id = os.environ.get('CLOSE_HOLD_MUSIC_PHONE_ID') ## The phone number id of the phone number in Close that contains the hold music.
-hold_music_url = None
+hold_music_url = ""
 close_phone_numbers = os.environ.get('CLOSE_PHONE_NUMBERS').split(',')
 
 ## Initiate the Twilio API
@@ -243,6 +243,7 @@ def dial_redirected_phone_number(request):
 ## Method for setting up the Wait URL in Twilio so that we give the user the option to leave the queue at any time and
 ## we also play a predetermined audio-file for hold music.
 def setup_wait_url():
+    global hold_music_url
     response = VoiceResponse()
     with response.gather(num_digits=1, action="/forward-to-vm/", method="POST") as g:
         g.say("Thanks for calling in,,,,,,Press any key at any time to exit the queue and be redirected to a voicemail box.")
@@ -376,8 +377,9 @@ def update_close_group_number_participation():
 
 ## Method to update the hold music for the integration via a Close number specified in close_hold_music_phone_id
 def update_hold_music():
+    global hold_music_url
     try:
-        phone_number = api.get('phone_number/' + close_hold_music_phone_id, params={ '_fields': 'voicemail_greeting_url'})
+        phone_number = api.get('phone_number/' + close_hold_music_phone_id)
         if not phone_number.get('voicemail_greeting_url'):
             logging.error(f"The specifed phone number does not have a voicemail_greeting")
             return False
