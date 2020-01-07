@@ -21,6 +21,8 @@ org_id = api.get('api_key/' + os.environ.get('CLOSE_API_KEY'))['organization_id'
 close_user_ids_to_twilio_worker_ids = {}
 close_user_ids_to_current_calls = {}
 close_user_ids_to_twilio_phone_numbers = {}
+close_hold_music_phone_id = os.environ.get('CLOSE_HOLD_MUSIC_PHONE_ID') ## The phone number id of the phone number in Close that contains the hold music.
+hold_music_url = None
 close_phone_numbers = os.environ.get('CLOSE_PHONE_NUMBERS').split(',')
 
 ## Initiate the Twilio API
@@ -38,7 +40,6 @@ twilio_phone_numbers_to_queue_id = {}
 
 ## Other Environmental Variables
 base_url = os.environ.get('BASE_URL') ## The Base URL of the Application
-filename = os.environ.get('FILENAME') ## The filename of the hold music used in the queues
 fallback_number = os.environ.get('FALLBACK_NUMBER') ## The fallback number used when Close needs to leave a voicemail or if something goes wrong.
 
 ## Generate Twilio to Close phone mapping
@@ -245,7 +246,7 @@ def setup_wait_url():
     response = VoiceResponse()
     with response.gather(num_digits=1, action="/forward-to-vm/", method="POST") as g:
         g.say("Thanks for calling in,,,,,,Press any key at any time to exit the queue and be redirected to a voicemail box.")
-        g.play(url_for('static', filename=filename))
+        g.play(hold_music_url)
     return twiml(response)
 
 ## Method to redirect on a keypress while waiting in a TaskQueue to leave a Voicemail on the fallback number.
@@ -289,10 +290,11 @@ def update_close_availability():
 
         ## We also check each phone number to see if there have been any phone number changes recently
         update_phone_memberships()
-        logging.info("Successfully finished a user poll to update availability and phone memberships")
+        update_hold_music()
+        logging.info("Successfully finished a user poll to update availability, phone memberships, and updating the hold music")
         return True
     except Exception as e:
-        logging.error(f"Failed when updating Close User availabilities because {str(e)}")
+        logging.error(f"Failed when updating Close User availabilities or the hold music because {str(e)}")
         return str(e)
 
 ## Method to map phone numbers to user ids for each of the Twilio numbers passed through in environmental arguments.
@@ -369,6 +371,20 @@ def update_close_group_number_participation():
         return True
     except Exception as e:
         logging.error(f"Failed to update Close group number participants because {str(e)}")
+        return str(e)
+
+
+## Method to update the hold music for the integration via a Close number specified in close_hold_music_phone_id
+def update_hold_music():
+    try:
+        phone_number = api.get('phone_number/' + close_hold_music_phone_id, params={ '_fields': 'voicemail_greeting_url'})
+        if not phone_number.get('voicemail_greeting_url'):
+            logging.error(f"The specifed phone number does not have a voicemail_greeting")
+            return False
+        hold_music_url = phone_number['voicemail_greeting_url']
+        return True
+    except Exception as e:
+        logging.error(f"Failed to get updated Hold Music URL because {str(e)}")
         return str(e)
 
 ## Method to process Close call webhooks in the integration. In this case, process means that when an "activity.call.updated"
