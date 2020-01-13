@@ -246,7 +246,6 @@ def setup_wait_url():
     global hold_music_url
     response = VoiceResponse()
     with response.gather(num_digits=1, action="/forward-to-vm/", method="POST") as g:
-        g.say("Thanks for calling in,,,,,,Press any key at any time to exit the queue and be redirected to a voicemail box.")
         g.play(hold_music_url)
     return twiml(response)
 
