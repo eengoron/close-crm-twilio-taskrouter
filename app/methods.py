@@ -276,6 +276,7 @@ def make_sure_all_memberships_have_workers_on_startup():
 ## This method runs on a schedule to consistently poll the Close API for new availability information.
 def update_close_availability():
     try:
+        update_close_group_number_participation()
         current_close_availability = api.get('user/availability', params={ 'organization_id': org_id })
         for user in current_close_availability['data']:
             if close_user_ids_to_twilio_worker_ids.get(user['user_id']):
