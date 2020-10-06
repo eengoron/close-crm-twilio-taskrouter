@@ -1,0 +1,3 @@
+# Ignore when deploying to Heroku
+pyproject.toml
+setup.cfg

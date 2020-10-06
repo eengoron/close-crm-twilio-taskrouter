@@ -1,230 +1,358 @@
-from closeio_api import Client as CloseIO_API, APIError
-import os
-import logging
-from twilio.rest import Client
 import json
-import flask
-from flask import Response, url_for
-from twilio.twiml.voice_response import VoiceResponse, Play
+import logging
+import os
 
-## Format Logging
+import flask
+from closeio_api import Client as CloseIO_API
+from flask import Response
+from twilio.rest import Client
+from twilio.twiml.voice_response import VoiceResponse
+
+# Format Logging
 log_format = "[%(asctime)s] %(levelname)s %(message)s"
 logging.basicConfig(level=logging.INFO, format=log_format)
 twilio_logger = logging.getLogger('twilio')
 twilio_logger.setLevel(logging.ERROR)
 
-## Initiate Close API
+SITE_ROOT = os.path.realpath(os.path.dirname(__file__))
+json_url = os.path.join(SITE_ROOT, "static/", "config.json")
+with open(json_url) as f:
+    config = json.load(f)
+
+hold_music_url = os.path.join(
+    SITE_ROOT, "static/", config['hold_music_filename']
+)
+
+# Initialize Close Variables
 api = CloseIO_API(os.environ.get('CLOSE_API_KEY'))
-org_id = api.get('api_key/' + os.environ.get('CLOSE_API_KEY'))['organization_id']
+org_id = api.get('api_key/' + os.environ.get('CLOSE_API_KEY'))[
+    'organization_id'
+]
 
-## Initialize Close Variables
-close_user_ids_to_twilio_worker_ids = {}
-close_user_ids_to_current_calls = {}
-close_user_ids_to_twilio_phone_numbers = {}
-close_hold_music_phone_id = os.environ.get('CLOSE_HOLD_MUSIC_PHONE_ID') ## The phone number id of the phone number in Close that contains the hold music.
-hold_music_url = ""
-close_phone_numbers = os.environ.get('CLOSE_PHONE_NUMBERS').split(',')
-
-## Initiate the Twilio API
-twilio_client = Client(os.environ.get('TWILIO_ACCOUNT_SID'), os.environ.get('TWILIO_AUTH_TOKEN'))
+# Initialize the Twilio API
+twilio_client = Client(
+    os.environ.get('TWILIO_ACCOUNT_SID'), os.environ.get('TWILIO_AUTH_TOKEN')
+)
 workspace_sid = os.environ.get('TWILIO_WORKSPACE_SID')
 workflow_sid = os.environ.get('TWILIO_WORKFLOW_SID')
 
-## Initialize Twilio Varaibles
-twilio_phone_numbers = os.environ.get('TWILIO_PHONE_NUMBERS').split(',')
-twilio_statuses = {}
-twilio_worker_ids_to_close_user_ids = {}
-twilio_workers_availability_status = {}
-twilio_to_close_phone_mapping = {}
-twilio_phone_numbers_to_queue_id = {}
+# The Base URL of the Application
+base_url = os.environ.get('BASE_URL')
 
-## Other Environmental Variables
-base_url = os.environ.get('BASE_URL') ## The Base URL of the Application
-fallback_number = os.environ.get('FALLBACK_NUMBER') ## The fallback number used when Close needs to leave a voicemail or if something goes wrong.
-
-## Generate Twilio to Close phone mapping
-for x in range(0, len(twilio_phone_numbers)):
-    twilio_to_close_phone_mapping[twilio_phone_numbers[x]] = close_phone_numbers[x]
-
-##########################
+#######
 # Twilio
-##########################
+#######
 
-## TwiML conversion helper when returning a response from one of the methods below
+
 def twiml(resp):
+    """Helper method to wrap TwiML."""
     resp = flask.Response(str(resp))
     resp.headers['Content-Type'] = 'text/xml'
     return resp
 
-## Method to get the IDs of possible Twilio Worker statuses. In this case, we only use
-## the default Twilio worker statuses of "Offline", "Available", and "Unavailable" because those are the only three options
-## we need. With this being said, This method gets the SIDs of "Offline", "Available", and "Unavailable" for the specific
-## Twilio account because we need them to update the statuses of workers when new calls come in.
-def get_twilio_worker_statuses():
-    try:
-        activities = twilio_client.taskrouter.workspaces(workspace_sid).activities.list()
-        twilio_statuses.update({ i.friendly_name : i.sid for i in activities })
-        return twilio_statuses
-    except Exception as e:
-        logging.error(f"Failed when getting possible worker activities because {str(e)}")
-        return str(e)
 
-## Method to get a list of all Twilio workers for a particular workspace and make the corresponding
-## mapping array between Close users and Twilio Worker IDs. Additionally, this method also
-## creates a mapping of Twilio Workers with a "close_user_id" attribute in Twilio and Close group numbers to be used
-## when updating potential group numbers for a Close user.
-def get_twilio_workers():
+def _fetch_worker_sid_to_worker_attributes_map():
+    """
+    Return a dictionary of Twilio Worker SIDs to useful attributes about the
+    worker:
+        friendly_name: The name of the Worker
+        activity_name: The current activity name the Worker has in Twilio. This
+            is the equivalent of the user's availability in Close and can have a
+            a value of online, offline, or on_call.
+        close_user_id: The Close User ID of the Twilio Worker.
+        groups: A list of groups that the Twilio Worker is a part of, taken
+        from Close.
+    """
+    worker_sid_to_attributes_map = {}
     try:
-        all_workers = twilio_client.taskrouter.workspaces(workspace_sid).workers.list()
+        all_workers = twilio_client.taskrouter.workspaces(
+            workspace_sid
+        ).workers.list()
         for worker in all_workers:
+            worker_data = {
+                'friendly_name': worker.friendly_name,
+                'activity_name': worker.activity_name,
+            }
             attributes = json.loads(worker.attributes)
             if attributes.get('close_user_id'):
-                close_user_ids_to_twilio_worker_ids[attributes['close_user_id']] = worker.sid
-                twilio_worker_ids_to_close_user_ids[worker.sid] = attributes['close_user_id']
-                twilio_workers_availability_status[worker.sid] = worker.activity_name
-            if attributes.get('group_phones'):
-                close_user_ids_to_twilio_phone_numbers[attributes['close_user_id']] = attributes['group_phones']
-        return True
+                worker_data.update(attributes)
+            worker_sid_to_attributes_map[worker.sid] = worker_data
     except Exception as e:
-        logging.error(f"Failed when getting all twilio workers and making the corresponding mapping arrays because {str(e)}")
-        return str(e)
+        logging.error(
+            f"Failed to fetch a worker sid to attributes map because {str(e)}"
+        )
 
-## Method to generate a mapping from Twilio Phone numbers to Twilio Queue IDs to be used when forwarding a number or decding
-## if a call should just go to the fallback number.
-def get_twilio_taskrouter_queues():
+    return worker_sid_to_attributes_map
+
+
+def _fetch_queue_by_twilio_number(twilio_number):
+    """
+    Fetches a queue mapping by twilio_number.
+
+    Args:
+        twilio_number: The number you want to search for in the list of queues
+
+    Returns:
+        dict: The queue config for that Twilio number, or None if it does not
+        exist.
+    """
     try:
-        all_queues = twilio_client.taskrouter.workspaces(workspace_sid).task_queues.list()
-        twilio_phone_numbers_to_queue_id.update({ i.friendly_name : i.sid for i in all_queues if i.friendly_name in twilio_phone_numbers })
-        return twilio_phone_numbers_to_queue_id
-    except Exception as e:
-        logging.error(f"Failed when getting possible twilio task router queues because {str(e)}")
-        return str(e)
+        return [
+            i
+            for i in config['queue_mappings']
+            if i['twilio_number'] == twilio_number
+        ][0]
+    except Exception:
+        logging.error(f'A queue for {twilio_number} does not exist')
+        return None
 
-## Method to update Twilio worker's status by worker_id. This method is used when users log into and out of close
-## and when calls come into and out of Close to update the workers status in Twilio.
+    return None
+
+
 def update_twilio_worker_status(worker_sid, new_status):
+    """
+    Update a given Twilio Worker's status in Twilio to a new status.
+
+    The status can either be:
+     - online
+     - offline
+     - on_call
+
+    Given the friendly name of the new status, we use the twilio_status_mapping
+    config to get the activity_sid, and PUT that onto the worker.
+
+    Args:
+        worker_sid (str): The worker's SID in Twilio
+        new_status (str): The friendly_name of the worker's new status in Twilio
+    """
     try:
-        if twilio_statuses.get(new_status):
-            twilio_client.taskrouter.workspaces(workspace_sid).workers(worker_sid).update(activity_sid=twilio_statuses[new_status])
-            twilio_workers_availability_status[worker_sid] = new_status
-            return new_status
+        activity_sid = config['twilio_status_mapping'].get(new_status)
+        if activity_sid:
+            twilio_client.taskrouter.workspaces(workspace_sid).workers(
+                worker_sid
+            ).update(activity_sid=activity_sid)
         else:
-            logging.error(f"Failed when updating the status of {worker_sid} to {new_status} because the status does not exist")
+            logging.error(
+                f"Failed when updating the status of {worker_sid} to {new_status} because the status does not exist"
+            )
     except Exception as e:
-        logging.error(f"Failed when updating the status of {worker_sid} to {new_status} because {str(e)}")
-        return str(e)
+        logging.error(
+            f"Failed when updating the status of {worker_sid} to {new_status} because {str(e)}"
+        )
 
-## Method to update Twilio worker attributes by worker_sid. Used for when updating phone number memberships
-def update_worker_phone_numbers_attribute(worker_sid, phone_numbers):
+
+def update_twilio_worker_groups_attribute(worker_sid, close_user_id, groups):
+    """
+    Update a given Twilio Worker's groups attribute to a new list of groups.
+
+    Args:
+        worker_sid (str): The worker's SID in Twilio
+        close_user_id (str): The Close User ID of the current worker
+        groups (list): The list of user manager groups that this Worker is
+        currently a part of in Close.
+    """
     try:
-        close_user_id = twilio_worker_ids_to_close_user_ids.get(worker_sid)
-        if close_user_id:
-            attributes = { 'close_user_id' : close_user_id, 'group_phones': phone_numbers }
-            attributes = json.dumps(attributes)
-            twilio_client.taskrouter.workspaces(workspace_sid).workers(worker_sid).update(attributes=attributes)
-            close_user_ids_to_twilio_phone_numbers[close_user_id] = phone_numbers
-        return True
+        attributes = {'close_user_id': close_user_id, 'groups': groups}
+        attributes = json.dumps(attributes)
+        twilio_client.taskrouter.workspaces(workspace_sid).workers(
+            worker_sid
+        ).update(attributes=attributes)
     except Exception as e:
-        logging.error(f"Failed updating {worker_sid}'s phone number attribute because {str(e)}")
-        return str(e)
-
-## Method to check whether or not all users assigned to a specific TaskQueue are offline. If they are, we just forward to the group number in Close
-## so that they can leave a voicemail, and bypass the queue completely. We do this instead of creating a "Queue" for Voicemail in Twilio because
-## we want the voicemail to be logged in Close.
-def check_for_online_users_based_on_twilio_phone(phone):
-    try:
-        close_users = [i for i in list(close_user_ids_to_twilio_phone_numbers.keys()) if phone in close_user_ids_to_twilio_phone_numbers[i]]
-        for user in close_users:
-            twilio_worker_id = close_user_ids_to_twilio_worker_ids.get(user)
-            if twilio_worker_id and twilio_workers_availability_status.get(twilio_worker_id, "Offline") in ['Available', 'Unavailable']:
-                return True
-        return False
-    except Exception as e:
-        logging.error(f"Failed when checking to see if any users were online for {phone} because {str(e)}")
-        return False
+        logging.error(
+            f"Failed updating {worker_sid}'s groups attribute because {str(e)}"
+        )
 
 
-## Method to create a Twilio worker when a new user is added into Close based on the membership.activated event
 def create_twilio_worker(close_user_id, user_name):
+    """
+    Create a new Twilio Worker.
+
+    Args:
+        close_user_id (str): The user ID of the newly added user.
+        user_name (str): The name of the newly added user.
+    """
     try:
-        attributes = { 'close_user_id': close_user_id }
-        new_worker = twilio_client.taskrouter.workspaces(workspace_sid).workers.create(friendly_name=user_name, attributes=json.dumps(attributes))
-        twilio_worker_ids_to_close_user_ids[new_worker.sid] = close_user_id
-        close_user_ids_to_twilio_worker_ids[close_user_id] = new_worker.sid
-        twilio_workers_availability_status[new_worker.sid]  = "Offline"
-        update_close_availability()
-        return new_worker
+        attributes = {'close_user_id': close_user_id, 'groups': []}
+        twilio_client.taskrouter.workspaces(workspace_sid).workers.create(
+            friendly_name=user_name, attributes=json.dumps(attributes)
+        )
     except Exception as e:
-        logging.error(f"Failed to create a new Twilio worker with name {user_name} and user_id {close_user_id} because {str(e)}")
+        logging.error(
+            f"Failed to create a new Twilio worker with name {user_name} and user_id {close_user_id} because {str(e)}"
+        )
         return str(e)
 
-## Method to delete a worker when a membership is deactivated in Close based on the membership.deactivated event
-## If a user is removed and then readded, the worker will be recreated.
+
 def remove_twilio_worker_by_worker_sid(worker_sid):
+    """
+    Removes a Twilio worker.
+
+    Args:
+        worker_sid: The SID of the worker being removed.
+    """
     try:
-        twilio_client.taskrouter.workspaces(workspace_sid).workers(worker_sid).delete()
+        twilio_client.taskrouter.workspaces(workspace_sid).workers(
+            worker_sid
+        ).delete()
     except Exception as e:
-        logging.error(f"Failed to delete a twilio worker with worker_sid {worker_sid} because {str(e)}")
+        logging.error(
+            f"Failed to delete a twilio worker with worker_sid {worker_sid} because {str(e)}"
+        )
         return str(e)
 
-## Method to mark a Twilio task as "completed" as soon as it's assigned assigned. The reason we do this is because
-## we have to use the redirect verb with enqueue so that the originators Caller ID will be correctly reflected in Close.
-## However, once a redirect occurs, the task remains in the TaskQueue, so we need to complete it to make users "Available" to accept
-## new calls again.
+
+def check_for_online_users_based_on_twilio_phone(phone):
+    """
+    Check whether or not all users assigned to a specific TaskQueue are offline.
+    If they are, we just forward to the group number in Close so that they can
+    leave a voicemail, and bypass the queue completely.
+
+    We do this instead of creating a "Queue" for Voicemail in Twilio because
+    we want the voicemail to be logged in Close.
+
+    Args:
+        phone (str): The phone number of the Twilio queue dialed into
+
+    Returns:
+        bool: True if users are online, false if all users are offline.
+    """
+    try:
+        queue_for_number = _fetch_queue_by_twilio_number(phone)
+        if not queue_for_number:
+            logging.error(
+                f'Could not check for Online users because a queue for {phone} does not exist.'
+            )
+            return False
+
+        group_id_for_queue = queue_for_number['close_user_manager_group_id']
+        twilio_workers = _fetch_worker_sid_to_worker_attributes_map()
+        for worker_sid, attributes in twilio_workers.items():
+            if attributes.get('close_user_id') and attributes.get('groups'):
+                if (
+                    group_id_for_queue in attributes['groups']
+                    and attributes['activity_name'] != 'offline'
+                ):
+                    return True
+    except Exception as e:
+        logging.error(
+            f"Failed when checking to see if any users were online for {phone} because {str(e)}"
+        )
+        return False
+
+    return False
+
+
 def mark_twilio_task_as_done_when_assigned(task_sid):
-    try:
-        twilio_client.taskrouter.workspaces(workspace_sid).tasks(task_sid).update(assignment_status='completed')
-        return True
-    except Exception as e:
-        logging.error(f"Failed to mark task {task_sid} as complete because {str(e)}")
-        return str(e)
+    """
+    Mark a Twilio task as "completed" as soon as it's assigned assigned.
 
-## Method for correctly queuing a Twilio call based on the number that they called into. Before we use the enqueue verb,
-## we double check to make sure someone is online, so that if no one is online, we can completely bypass the queue and let
-## the user leave a voicemail ASAP. If the user is waiting in the queue, they have the option to press any key to leave a voicemail at any time.
-## If they choose to leave a voicemail, they will be redirected to a Close fallback number that goes directly to voicemail.
+    The reason we do this is because we have to use the redirect verb with
+    enqueue so that the originators Caller ID will be correctly reflected in
+    Close.
+
+    However, once a redirect occurs, the task remains in the TaskQueue, so we
+    need to complete it to make users "online"/"available" to accept new calls
+    again.
+
+    Args:
+        task_sid (str): The ID of the task in Twilio we want to mark as
+            complete.
+    """
+    try:
+        twilio_client.taskrouter.workspaces(workspace_sid).tasks(
+            task_sid
+        ).update(assignment_status='completed')
+    except Exception as e:
+        logging.error(
+            f"Failed to mark task {task_sid} as complete because {str(e)}"
+        )
+
+
 def send_call_to_queue(request):
+    """
+    Queue a Twilio call based on the number (queue) that was called. Before we
+    use the enqueue verb, we double check to make sure someone is online.
+
+    If no one is online, we completely bypass the queue and let the user
+    leave a voicemail ASAP.
+
+    If the user is waiting in the queue, they have the option to press any key
+    to leave a voicemail at any time. If they choose to leave a voicemail,
+    they will be redirected to a Close fallback number that goes directly to
+    voicemail.
+    """
+    response = VoiceResponse()
     try:
         to_number = request.values.get('To')
-        if to_number and to_number in list(twilio_phone_numbers_to_queue_id.keys()):
-            response = VoiceResponse()
-            if check_for_online_users_based_on_twilio_phone(to_number):
-                enqueue = response.enqueue(None, workflow_sid=workflow_sid, wait_url='/wait-url/')
-                enqueue.task(json.dumps({ 'to_number': to_number }))
-                response.dial(fallback_number)
-                response.append(enqueue)
-            else:
-                if twilio_to_close_phone_mapping.get(to_number):
-                    response.dial(twilio_to_close_phone_mapping[to_number])
-                else:
-                    response.dial(fallback_number)
-                    logging.error(f"The fallback number was used to redirect a call because {to_number} did not exist in the Twilio > Close Phone Mapping.")
+        queue = _fetch_queue_by_twilio_number(to_number)
+        # If the number doesn't exist in any queue, return early and use the
+        # fallback number. This should never happen, but is there just in case.
+        if not queue:
+            response.dial(config['fallback_number'])
+            logging.error(
+                f"The fallback number was used to redirect a call because {to_number} is not a real queue."
+            )
+
+        # If no one is online, but the queue exists dial the number directly so
+        # that the caller can leave a voicemail.
+        if (
+            not check_for_online_users_based_on_twilio_phone(to_number)
+            and queue
+        ):
+            response.dial(queue['close_group_number'])
+
+        enqueue = response.enqueue(
+            None, workflow_sid=workflow_sid, wait_url='/wait-url/'
+        )
+        enqueue.task(json.dumps({'to_number': to_number}))
+        response.dial(config['fallback_number'])
+        response.append(enqueue)
         return twiml(response)
     except Exception as e:
-        logging.error(f"Failed to correctly send a call to the correct desination because {str(e)}")
-        return str(e)
+        logging.error(
+            f"Failed to correctly send a call to the correct desination because {str(e)}"
+        )
 
-## Method for sending the redirect instruction to Twilio when calls are assigned so that when calls come into the Close group number
-## they display thecaller ID of the originator
+
 def send_redirect_instruction_on_assignment_callback(task_id, task_attributes):
+    """
+    Send the redirect instruction to Twilio when calls are assigned so that when
+    calls come into the Close group number they display thecaller ID of the
+    originator.
+    """
     try:
-        ## We redirect because otherwise Close won't display the right value for the incoming caller
+        queue = _fetch_queue_by_twilio_number(task_attributes.get('to_number'))
+
+        # We redirect because otherwise Close won't display the right value for the incoming caller
         response = {
             'instruction': 'redirect',
             'call_sid': task_attributes.get('call_sid'),
-            'url': f"{os.environ.get('BASE_URL')}redirect-task/?task_id={task_id}&phone_number={twilio_to_close_phone_mapping[task_attributes.get('to_number')]}",
-            'accept': True
+            'url': f"{os.environ.get('BASE_URL')}redirect-task/?task_id={task_id}&phone_number={queue['close_group_number']}",
+            'accept': True,
         }
 
-        resp = Response(response=json.dumps(response), status=200, mimetype='application/json')
+        resp = Response(
+            response=json.dumps(response),
+            status=200,
+            mimetype='application/json',
+        )
         return resp
     except Exception as e:
-        logging.error(f"Failed when redirecting a call to a Close group number because {str(e)}")
+        logging.error(
+            f"Failed when redirecting a call to a Close group number because {str(e)}"
+        )
         return str(e)
 
-## Method for handling the redirect instruction when it's sent on the assignment callback above. This method takes the phone_number that will be dialed
-## and the task_id from the URL, marks the task as "complete" so that it doesn't remain in the queue after it redirects, and then calls the appropriate number.
+
 def dial_redirected_phone_number(request):
+    """
+    Handle the redirect instruction when it's sent on the assignment callback
+    above.
+
+    This method takes the phone_number that will be dialed and the task_id from
+    the URL, marks the task as "complete" so that it doesn't remain in the queue
+    after it redirects, and then calls the appropriate number.
+    """
     try:
         phone_number = request.args.get('phone_number')
         task_id = request.args.get('task_id')
@@ -237,207 +365,294 @@ def dial_redirected_phone_number(request):
             response.dial()
         return twiml(response)
     except Exception as e:
-        logging.error(f"Failed when processing the redirect instruction for {phone_number} on {task_id} because {str(e)}")
-        return str(e)
+        logging.error(
+            f"Failed when processing the redirect instruction for {phone_number} on {task_id} because {str(e)}"
+        )
 
-## Method for setting up the Wait URL in Twilio so that we give the user the option to leave the queue at any time and
-## we also play a predetermined audio-file for hold music.
+
 def setup_wait_url():
-    global hold_music_url
+    """
+    Setup the Wait URL in Twilio so that we give the user the option to leave
+    the queue at any time and we also play a predetermined audio-file for hold
+    music.
+    """
     response = VoiceResponse()
-    with response.gather(num_digits=1, action="/forward-to-vm/", method="POST") as g:
+    with response.gather(
+        num_digits=1, action="/forward-to-vm/", method="POST"
+    ) as g:
         g.play(hold_music_url)
     return twiml(response)
 
-## Method to redirect on a keypress while waiting in a TaskQueue to leave a Voicemail on the fallback number.
+
 def redirect_key_press_to_vm(request):
+    """Redirect to voicemail on keypress."""
     response = VoiceResponse()
     response.leave()
     return twiml(response)
 
-##########################
+
+#######
 # Close
-##########################
+#######
 
-## Method to make sure that when the application starts up, all active Close users have a Worker in Twilio.
-## If not, a worker is created for them.
-def make_sure_all_memberships_have_workers_on_startup():
+
+def ensure_all_memberships_have_workers():
+    """
+    Make sure that every single active Close user in the given organization
+    has a Twilio worker.
+    """
+    twilio_workers = _fetch_worker_sid_to_worker_attributes_map()
+    existing_close_user_ids = {
+        attributes['close_user_id'] for k, attributes in twilio_workers.items()
+    }
     try:
-        memberships = api.get('organization/' + org_id, params={ '_fields': 'memberships'})['memberships']
+        memberships = api.get(
+            'organization/' + org_id, params={'_fields': 'memberships'}
+        )['memberships']
         for membership in memberships:
-            if membership['user_id'] not in close_user_ids_to_twilio_worker_ids:
-                create_twilio_worker(membership['user_id'], membership['user_full_name'])
+            if membership['user_id'] not in existing_close_user_ids:
+                create_twilio_worker(
+                    membership['user_id'], membership['user_full_name']
+                )
         return True
     except Exception as e:
-        logging.error(f"Failed when checking for Twilio workers on startup because {str(e)}")
-        return str(e)
+        logging.error(
+            f"Failed when checking for Twilio workers on startup because {str(e)}"
+        )
 
-## Method to update Close user availability in Twilio based on login, logouts as well as incoming and outgoing phone calls that are picked up.
-## This method runs on a schedule to consistently poll the Close API for new availability information.
-def update_close_availability():
+
+def process_close_group_update(group_id, group_members):
+    """
+    Process group updates by making sure Twilio Workers are in order.
+
+    When a new members update comes in for groups involved in a queue,
+    ensure that every user has a Twilio worker and that statuses in Twilio are
+    correct.
+    """
     try:
-        update_close_group_number_participation()
-        current_close_availability = api.get('user/availability', params={ 'organization_id': org_id })
-        for user in current_close_availability['data']:
-            if close_user_ids_to_twilio_worker_ids.get(user['user_id']):
-                twilio_worker_id = close_user_ids_to_twilio_worker_ids.get(user['user_id'])
-                if twilio_worker_id:
-                    native_availability = [i['status'] == 'online' for i in user['availability'] if i['type'] == 'native'][0]
-                    new_twilio_status = 'Offline' if not native_availability else "Available"
-                    if new_twilio_status == 'Available' and len(close_user_ids_to_current_calls.get(user['user_id'], [])) != 0:
-                        new_twilio_status = 'Unavailable'
-                    if twilio_workers_availability_status.get(twilio_worker_id) != new_twilio_status:
-                        update_twilio_worker_status(twilio_worker_id, new_twilio_status)
-
-        ## We also check each phone number to see if there have been any phone number changes recently
-        update_phone_memberships()
-        update_hold_music()
-        logging.info("Successfully finished a user poll to update availability, phone memberships, and updating the hold music")
-        return True
-    except Exception as e:
-        logging.error(f"Failed when updating Close User availabilities or the hold music because {str(e)}")
-        return str(e)
-
-## Method to map phone numbers to user ids for each of the Twilio numbers passed through in environmental arguments.
-## For this to work, the Twilio number must be added as an Virtual group number in Close. We use Virtual group numbers as opposed to
-## external Caller IDs because you can't update memberships on external Caller IDs.
-def update_phone_memberships():
-    try:
-        user_ids_to_phones = {}
-        phone_numbers = []
-
-        for number in twilio_phone_numbers:
-            phones = api.get('phone_number', params={ 'number': number })
-            if phones['data']:
-                phone = phones['data'][0]
-                for participant in phone['participants']:
-                    if participant.startswith('user_'):
-                        if participant in user_ids_to_phones:
-                            user_ids_to_phones[participant].append(number)
-                        else:
-                            user_ids_to_phones[participant] = [number]
-
-        for worker_id in twilio_worker_ids_to_close_user_ids:
-            user_id = twilio_worker_ids_to_close_user_ids[worker_id]
-            if user_ids_to_phones.get(user_id):
-                if len(close_user_ids_to_twilio_phone_numbers.get(user_id, [])) != len(user_ids_to_phones[user_id]):
-                    update_worker_phone_numbers_attribute(worker_id, user_ids_to_phones[user_id])
-            elif close_user_ids_to_twilio_phone_numbers.get(user_id, []) != []:
-                update_worker_phone_numbers_attribute(worker_id, [])
-        return True
-    except Exception as e:
-        logging.error(f"Failed when updating phone memberships because {str(e)}")
-        return str(e)
-
-## Method to either create or delete Twilio worker based on an updated membership status in Close.
-def update_close_membership(user_id, action):
-    try:
-        if action == 'deactivated':
-            worker_sid = close_user_ids_to_twilio_worker_ids.get(user_id)
-            if worker_sid:
-                del close_user_ids_to_twilio_worker_ids[user_id]
-                if close_user_ids_to_current_calls.get(user_id):
-                    del close_user_ids_to_current_calls[user_id]
-                if twilio_worker_ids_to_close_user_ids.get(worker_sid):
-                    del twilio_worker_ids_to_close_user_ids[worker_sid]
-                remove_twilio_worker_by_worker_sid(worker_sid)
-        if action == 'activated':
-            user = api.get(f'user/{user_id}', params={ '_fields': 'first_name,last_name'})
-            user_name = f"{user['first_name']} {user['last_name']}"
-            if user_name and user_name != "":
-                create_twilio_worker(user_id, user_name)
-        return user_id
-    except Exception as e:
-        logging.error(f"Failed when a membership was {action} for {user_id} because {str(e)}")
-        return str(e)
-
-## Method to update Close group number participants based on current ongoing calls. This method is responsible for updating the members of
-## Close group numbers that can receive certain calls, based on the participants of the Caller ID virtual numbers that correspond to the numbers in
-## Twilio. In essence, this method syncs the Virtual Number Caller IDs, with the actual users that can receive calls in Close, based on if they have
-## any ongoing calls.
-def update_close_group_number_participation():
-    try:
-        for number in twilio_phone_numbers:
-            if number in twilio_to_close_phone_mapping:
-                phones = api.get('phone_number', params={ 'number': number })
-                if phones['data']:
-                    phone = phones['data'][0]
-                    participants = phone['participants']
-                    for user in list(close_user_ids_to_current_calls.keys()):
-                        if user in participants:
-                            participants.remove(user)
-                    close_number = api.get('phone_number', params={ 'number': twilio_to_close_phone_mapping[number] })
-                    if close_number['data'] and sorted(close_number['data'][0]['participants']) != sorted(participants):
-                        api.put('phone_number/' + close_number['data'][0]['id'], data={ 'participants': participants })
-        return True
-    except Exception as e:
-        logging.error(f"Failed to update Close group number participants because {str(e)}")
-        return str(e)
-
-
-## Method to update the hold music for the integration via a Close number specified in close_hold_music_phone_id
-def update_hold_music():
-    global hold_music_url
-    try:
-        phone_number = api.get('phone_number/' + close_hold_music_phone_id)
-        if not phone_number.get('voicemail_greeting_url'):
-            logging.error(f"The specifed phone number does not have a voicemail_greeting")
+        if group_id not in [
+            i['close_user_manager_group_id'] for i in config['queue_mappings']
+        ]:
             return False
-        hold_music_url = phone_number['voicemail_greeting_url']
-        return True
-    except Exception as e:
-        logging.error(f"Failed to get updated Hold Music URL because {str(e)}")
-        return str(e)
 
-## Method to process Close call webhooks in the integration. In this case, process means that when an "activity.call.updated"
-## webhook comes in and the status of the call is "in-progress", we mark the Twilio worker corresponding to the Close user of the call as
-## "Unavailable". Additionally, when a "completed" call webhook comes in, if the Close user currently has no other active calls,
-## we mark them as available again.
-def process_close_call_event(user_id, action, object_id):
+        # On any group update that matters, make sure everyone's Twilio workers
+        # are in order.
+        ensure_all_memberships_have_workers()
+        update_all_twilio_statuses_and_group_number_participants()
+    except Exception as e:
+        logging.error(
+            f'Failed to proccess Close group update for {group_id} because {str(e)}'
+        )
+
+
+def _fetch_user_id_to_close_availability_map():
+    """
+    Return a dictionary of User ID to availability status in Close. The
+    possible values are:
+     - online: The user is online in the native application
+     - offline: The user is offline in the native application
+     - on_call: The user is currently on a call in Close
+    """
+    user_availability_map = {}
     try:
-        worker_id = close_user_ids_to_twilio_worker_ids.get(user_id)
-        updated_stat = None
-
-        ## If action is equal to updated, meaning a call was moved to in-progress, make sure the Close user moves to Unavailable in Twilio
-        if action == 'updated':
-            if user_id in close_user_ids_to_current_calls:
-                close_user_ids_to_current_calls[user_id].append(object_id)
-            else:
-                close_user_ids_to_current_calls[user_id] = [object_id]
-                updated_stat = 'Unavailable'
-
-        ## If action is equal to completed, meaning a call was just finished, mark the Close user as "Available" in Twilio assuming that they have no other
-        ## ongoing calls.
-        elif action == 'completed':
-            if close_user_ids_to_current_calls.get(user_id) and object_id in close_user_ids_to_current_calls[user_id]:
-                close_user_ids_to_current_calls[user_id].remove(object_id)
-                if len(close_user_ids_to_current_calls[user_id]) == 0:
-                    del close_user_ids_to_current_calls[user_id]
-                    updated_stat = 'Available'
-
-        if worker_id and updated_stat and twilio_workers_availability_status.get(worker_id) != updated_stat:
-            print(f"Updated status of {user_id} to {updated_stat}")
-            update_close_group_number_participation()
-            update_twilio_worker_status(worker_id, updated_stat)
-        return True
-
+        current_availability = api.get(
+            'user/availability', params={'organization_id': org_id}
+        )
+        for user in current_availability['data']:
+            native_app_availability = [
+                i for i in user['availability'] if i['type'] == 'native'
+            ][0]
+            status = native_app_availability.get('status', 'offline')
+            if native_app_availability.get('active_calls', []):
+                status = 'on_call'
+            user_availability_map[user['user_id']] = status
     except Exception as e:
-        logging.error(f"Failed when processing a Close call event because {str(e)}")
-        return str(e)
+        logging.error(f'Could not pull user availability map because {str(e)}')
+    return user_availability_map
 
-## Method to initialize all possible variables when the integration first begins
-def initialize_integration_variables():
+
+def _fetch_group_id_group_users_map():
+    """
+    Returns a dictionary of group_id to list of user_ids currently in that
+    group.
+
+    We get our group_id list from config.json.
+    """
+    group_members_mapping = {}
     try:
-        get_twilio_worker_statuses()
-        get_twilio_workers()
-        make_sure_all_memberships_have_workers_on_startup()
-        get_twilio_taskrouter_queues()
-        update_close_availability()
-        update_close_group_number_participation()
-        logging.info("Integration successfully initialized")
+        groups = [
+            i['close_user_manager_group_id'] for i in config['queue_mappings']
+        ]
+        for group in groups:
+            resp = api.get(f'group/{group}', params={'_fields': 'members'})[
+                'members'
+            ]
+            group_members_mapping[group] = [i['user_id'] for i in resp]
     except Exception as e:
-        logging.error(f"Failed to initialize integration because {str(e)}")
+        logging.error(f'Could not pull groups to users map because {str(e)}')
+    return group_members_mapping
+
+
+def update_groups_attribute_for_twilio_workers_from_list_of_users_in_close_groups(
+    groups_to_users_map=None, twilio_workers=None
+):
+    """
+    Pull a list of users for the user manager groups (listed in config.js) from
+    Close and make sure that each user in each group has that group attribute
+    listed on their Twilio Workers.
+    """
+    try:
+        twilio_workers = (
+            twilio_workers or _fetch_worker_sid_to_worker_attributes_map()
+        )
+        groups_to_users_map = (
+            groups_to_users_map or _fetch_group_id_group_users_map()
+        )
+        close_user_ids_to_twilio_worker_ids = {
+            attributes['close_user_id']: k
+            for k, attributes in twilio_workers.items()
+        }
+        twilio_worker_to_group_mappings = {
+            k: [] for k, attributes in twilio_workers.items()
+        }
+        for group, user_ids in groups_to_users_map.items():
+            for user_id in user_ids:
+                worker_id = close_user_ids_to_twilio_worker_ids.get(
+                    user_id, None
+                )
+                if worker_id:
+                    twilio_worker_to_group_mappings[worker_id].append(group)
+
+        for k, attributes in twilio_workers.items():
+            worker_groups = twilio_worker_to_group_mappings.get(k, [])
+            if not attributes.get('groups') or sorted(
+                attributes.get('groups', [])
+            ) != sorted(worker_groups):
+                update_twilio_worker_groups_attribute(
+                    k, attributes['close_user_id'], worker_groups
+                )
+    except Exception as e:
+        logging.error(
+            f"Failed to update groups attribute for Twilio Workers from a Close list because {str(e)}"
+        )
+
+
+def delete_twilio_worker_from_close_user_id(user_id):
+    """
+    Delete a Twilio worker when a user is deactivated in Close.
+
+    We first have to make the user offline, just in case the Availability
+    endpoint hasn't refreshed yet.
+
+    Args:
+        user_id: The user_id of the User that was deactivated in Close
+    """
+    try:
+        twilio_workers = _fetch_worker_sid_to_worker_attributes_map()
+        for worker_sid, attributes in twilio_workers.items():
+            if attributes['close_user_id'] == user_id:
+                update_twilio_worker_status(worker_sid, 'offline')
+                remove_twilio_worker_by_worker_sid(worker_sid)
+    except Exception as e:
+        logging.error(
+            f"Failed to delete worker for {user_id} because {str(e)}"
+        )
         return str(e)
 
-## Call initialize integration variables
-initialize_integration_variables()
+
+def update_close_group_number_participants_from_availability(
+    user_availability_map=None, groups_to_users_map=None
+):
+    """
+    Update Close group number participants for each queue based on the current
+    availability of each User in Close.
+    """
+    try:
+        user_availability_map = (
+            user_availability_map or _fetch_user_id_to_close_availability_map()
+        )
+        groups_to_users_map = (
+            groups_to_users_map or _fetch_group_id_group_users_map()
+        )
+        for queue in config['queue_mappings']:
+            user_ids_in_group = groups_to_users_map.get(
+                queue['close_user_manager_group_id'], []
+            )
+            expected_participants = [
+                user_id
+                for user_id in user_ids_in_group
+                if user_availability_map.get(user_id, 'offline') == 'online'
+            ]
+            participants_currently_in_close = api.get(
+                f"phone_number/{queue['close_group_number_id']}",
+                params={'_fields': 'participants'},
+            )['participants']
+            if sorted(expected_participants) != sorted(
+                participants_currently_in_close
+            ):
+                api.put(
+                    f"phone_number/{queue['close_group_number_id']}",
+                    data={'participants': expected_participants},
+                )
+    except Exception as e:
+        logging.error(
+            f"Failed to update Close group number participants because {str(e)}"
+        )
+
+
+def update_twilio_worker_statuses_from_close_status(
+    user_availability_map=None, twilio_workers=None
+):
+    """
+    Update every Twilio worker's status based on Close availability.
+
+    In order to do this, we first get the the availability from every user in
+    Close. Then, we get the list of Twilio workers so we can match Close User ID
+    to Twilio worker SID. Then we get update the status of each Twilio worker
+    that doesn't match their respective Close Status.
+    """
+    try:
+        user_availability_map = (
+            user_availability_map or _fetch_user_id_to_close_availability_map()
+        )
+        twilio_workers = (
+            twilio_workers or _fetch_worker_sid_to_worker_attributes_map()
+        )
+        for worker_sid, twilio_attributes in twilio_workers.items():
+            user_id = twilio_attributes.get('close_user_id', None)
+            if user_id:
+                user_status_in_close = user_availability_map.get(
+                    user_id, 'offline'
+                )
+                if twilio_attributes['activity_name'] != user_status_in_close:
+                    update_twilio_worker_status(
+                        worker_sid, user_status_in_close
+                    )
+    except Exception as e:
+        logging.error(
+            f"Failed to update Twilio worker statuses by Close availability because {str(e)}"
+        )
+
+
+def update_all_twilio_statuses_and_group_number_participants():
+    """
+    Updates Twilio Worker Status and Close Group Number participants based on
+    current availability status in Close.
+    """
+    close_availability = _fetch_user_id_to_close_availability_map()
+    group_users = _fetch_group_id_group_users_map()
+    twilio_workers = _fetch_worker_sid_to_worker_attributes_map()
+    update_twilio_worker_statuses_from_close_status(
+        user_availability_map=close_availability, twilio_workers=twilio_workers
+    )
+    update_close_group_number_participants_from_availability(
+        user_availability_map=close_availability,
+        groups_to_users_map=group_users,
+    )
+    update_groups_attribute_for_twilio_workers_from_list_of_users_in_close_groups(
+        groups_to_users_map=group_users, twilio_workers=twilio_workers
+    )
+
+
+ensure_all_memberships_have_workers()
+update_all_twilio_statuses_and_group_number_participants()
