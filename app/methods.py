@@ -226,7 +226,7 @@ def check_for_online_users_based_on_twilio_phone(phone):
 
         group_id_for_queue = queue_for_number['close_user_manager_group_id']
         twilio_workers = _fetch_worker_sid_to_worker_attributes_map()
-        for worker_sid, attributes in twilio_workers:
+        for worker_sid, attributes in twilio_workers.items():
             if attributes.get('close_user_id') and attributes.get('groups'):
                 if (
                     group_id_for_queue in attributes['groups']
