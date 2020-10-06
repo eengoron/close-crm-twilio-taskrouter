@@ -1,0 +1,35 @@
+{
+  "queue_mappings": [
+    {
+      "twilio_queue_sid": "WQec3aa775fbafe60230453803f5630bac",
+      "twilio_number": "+12082059919",
+      "close_group_number_id": "phon_0z8TlljNDJL4ogjCSBdylGt4wMKOADPH6gYWwLTprtK",
+      "close_group_number": "+12082681202",
+      "close_user_manager_group_id": "group_58aWtnHOHqeCJKHB1L2oLi",
+      "friendly_name": "NCD Insurance Licensed Agents"
+    },
+    {
+      "twilio_queue_sid": "WQ3787232391b7416bf5a1a350c4671a62",
+      "twilio_number": "+12082059763",
+      "close_group_number_id": "phon_GOsXRJJn5ks5fSP0Z4DTnYcfzkB4GlKRIvX3PecU8fZ",
+      "close_group_number": "+12082681206",
+      "close_user_manager_group_id": "group_27vPSQCNggyrjI9J3GmzO6",
+      "friendly_name": "NCD Insurance Qualify"
+    },
+    {
+      "twilio_queue_sid": "WQ335ba70c462b277958e481749a5a039c",
+      "twilio_number": "+12082059956",
+      "close_group_number_id": "phon_ySDmPfhGTap9nTGnUhdXUAaDcYmIt7OHBj2eV2KJtYF",
+      "close_group_number": "+12082681208",
+      "close_user_manager_group_id": "group_51w7K7bKl3qTa7rKez9F9Y",
+      "friendly_name": "National Credit Direct"
+    }
+  ],
+  "twilio_status_mapping": {
+    "offline": "WAf4b6277aa76a97088235a5dec8737289",
+    "online": "WA1b436cdf292bd2b55c2a9ba962979149",
+    "on_call": "WA1001a8fd6ebd372f9bb91e0fcdbc120c"
+  },
+  "hold_music_filename": "voicemail.mp3",
+  "fallback_number": "+12082093953"
+}
