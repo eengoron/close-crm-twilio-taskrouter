@@ -24,19 +24,18 @@ logging.basicConfig(level=logging.INFO, format=log_format)
 # Close Routes
 #############
 
-
 @app.route('/deactivate-membership/', methods=['POST'])
 def delete_twilio_worker():
     """Delete a Twilio Worker when a Close membership is deactivated."""
     try:
         data = json.loads(request.data)
         event_data = data['event']
-        if event_data['data'].get('user_id'):
+        if event_data.get('user_id'):
             delete_twilio_worker_from_close_user_id(
-                event_data['data']['user_id']
+                event_data['user_id']
             )
             logging.info(
-                f"Deleted {event_data['data']['user_id']}'s Twilio Worker because they were made inactive.'"
+                f"Deleted {event_data['user_id']}'s Twilio Worker because they were made inactive.'"
             )
         return "Webhook processed successfully", 200
     except Exception as e:

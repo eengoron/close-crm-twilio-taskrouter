@@ -4,7 +4,7 @@ import os
 
 import flask
 from closeio_api import Client as CloseIO_API
-from flask import Response
+from flask import Response, url_for
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 
@@ -18,10 +18,6 @@ SITE_ROOT = os.path.realpath(os.path.dirname(__file__))
 json_url = os.path.join(SITE_ROOT, "static/", "config.json")
 with open(json_url) as f:
     config = json.load(f)
-
-hold_music_url = os.path.join(
-    SITE_ROOT, "static/", config['hold_music_filename']
-)
 
 # Initialize Close Variables
 api = CloseIO_API(os.environ.get('CLOSE_API_KEY'))
@@ -380,7 +376,7 @@ def setup_wait_url():
     with response.gather(
         num_digits=1, action="/forward-to-vm/", method="POST"
     ) as g:
-        g.play(hold_music_url)
+        g.play(url_for('static', filename=config['hold_music_filename']))
     return twiml(response)
 
 
